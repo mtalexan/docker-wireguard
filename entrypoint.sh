@@ -11,6 +11,7 @@ readonly PING_CHECKS=${PING_CHECKS:-10}
 readonly CHECK_URL
 readonly CHECK_IPV4
 readonly CHECK_IPV6
+readonly IPTABLES_MANGLE_MODE=${IPTABLES_MANGLE_MODE:-rand}
 
 # where we find the wireguard config files from the user
 readonly WG_CONF_IN="/etc/wireguard"
@@ -40,6 +41,17 @@ cmd() {
     #shellcheck disable=SC2048 # we want word splitting, we're running the exact command that was passed
     $*
 }
+
+# double check the IPTABLES_MANGLE_MODE is set to a valid value if it's set at all
+if [[ -n $IPTABLES_MANGLE_MODE ]]; then
+    case "$IPTABLES_MANGLE_MODE" in
+        rr | round-robin | rand | random )
+            :
+            ;;
+        * )
+            die "IPTABLES_MANGLE_MODE not one of (rr, round-robin, rand, random): $IPTABLES_MANGLE_MODE"
+    esac
+fi
 
 #----------------------------------------------------
 # Initial network state detection
@@ -390,8 +402,26 @@ log "Detected IPv4: ${ipv4_allowed_str} IPv6: ${ipv6_allowed_str}"
 ipv4_nexthops=()
 ipv6_nexthops=()
 
+if [[ -n $IPTABLES_MANGLE_MODE ]]; then
+    # This sets up an initial PREROUTING rule that will detect if a RELATED connection already
+    # had an fwmark set, and will set the fwmark to match. It stops matching rules in the mangle
+    # table when this happens, so this has to be first.
+    # It also sets up a POSTROUTING rule that will save the fwmark for connections so it can be found
+    # by the PREROUTING rule.
+    log "Setting up pre-routing mangle rule to only apply to new connections"
+    if (( SUPPORTS_IPV4 > 0 )) && [[ -n $DEFAULT_ROUTE_IPV4 ]] ; then
+        cmd iptables -A PREROUTING -t mangle -j CONNMARK --restore-mark
+        cmd iptables -A POSTROUTING -t mangle -j CONNMARK --save-mark
+    fi
+    if (( SUPPORTS_IPV6 > 0 )) && [[ -n $DEFAULT_ROUTE_IPV6 ]] ; then
+        cmd ip6tables -A PREROUTING -t mangle -j CONNMARK --restore-mark
+        cmd ip6tables -A POSTROUTING -t mangle -j CONNMARK --save-mark
+    fi  
+fi
+
 log "Starting WireGuard interfaces..."
 
+interface_cntr=0
 for interface in "${WG_INTERFACES[@]}"; do
     log ""
     log "==== Configuring $interface ===="
@@ -475,6 +505,73 @@ for interface in "${WG_INTERFACES[@]}"; do
     # We effectively guess that the link-local IPv6 address of the gateway is fe80::1, because there's no way
     # to know what it actually is (that's now how wireguard works) and it's highly likely to be a correct guess.
     ipv6_nexthops+=("nexthop" "via" "fe80::1" "dev" "$interface" "weight" "1")
+    
+    if [[ -n $IPTABLES_MANGLE_MODE ]]; then
+        log "Setting up routing table for using $interface as default, and assigning a fwmark to it"
+        # For each interface we need a table with a default routing rule that routes to the interface,
+        # and a fwmark with a rule to route to that table.
+        
+        # get the next available fwmark and use it for mangling
+        mangle_fwmark="$(get_next_free_fwmark_from $NEXT_FWMARK)"
+        [[ -n $mangle_fwmark ]] || die "Getting next available fwmark for mangling"
+        # add our fwmark to the used list
+        USED_FWMARKS+=("$mangle_fwmark")
+        # set subsequent searches to happen after the fwmark we found available.
+        NEXT_FWMARK=$(( mangle_fwmark + 1))
+    
+        if [[ -n $DEFAULT_ROUTE_IPV4_DEV ]]; then
+            cmd ip -4 route add default dev $interface scope global table $mangle_fwmark || die
+            cmd ip -4 rule add fwmark $(printf '0x%x' "$mangle_fwmark") table $mangle_fwmark || die
+        fi
+        if [[ -n $DEFAULT_ROUTE_IPV6_DEV ]]; then
+            cmd ip -6 route add default dev $interface scope global table $mangle_fwmark || die
+            cmd ip -6 rule add fwmark $(printf '0x%x' "$mangle_fwmark") table $mangle_fwmark || die
+        fi
+        
+        if [[ $IPTABLES_MANGLE_MODE == 'rr' ]] || [[ $IPTABLES_MANGLE_MODE == 'round-robin' ]]; then
+            log "Setting round-robin connection route mangling with iptables"
+            # These rules only get used if the prior PREROUTING rule for CONNTRACK doesn't detect that the
+            # connection (or RELATED connection) already has a specific fwmark assigned to it.
+            # It uses the 'statistic' module to assign a fwmark associated with this interface to every Nth
+            # NEW connection, with this interface in particular being the Xth of N (X = the interface_cntr,
+            # N = the number of interfaces).
+            if (( SUPPORTS_IPV4 > 0 )) && [[ -n $DEFAULT_ROUTE_IPV4 ]] ; then
+                cmd iptables -t mangle -A PREROUTING -m conntrack --ctstate NEW -m statistic --mode nth --every ${#WG_INTERFACES[@]} --packet $interface_cntr -j MARK --set-mark $mangle_fwmark || die
+            fi
+            if (( SUPPORTS_IPV6 > 0 )) && [[ -n $DEFAULT_ROUTE_IPV6 ]] ; then
+                cmd ip6tables -t mangle -A PREROUTING -m conntrack --ctstate NEW -m statistic --mode nth --every ${#WG_INTERFACES[@]} --packet $interface_cntr -j MARK --set-mark $mangle_fwmark || die
+            fi
+        else
+            log "Setting random connection route mangling with iptables"
+            
+            # These rules only get used if the prior PREROUTING rule for CONNTRACK doesn't detect that the
+            # connection (or RELATED connection) already has a specific fwmark assigned to it.
+            # It uses the 'statistic' module to assign a random probability that the connection will be matched
+            # to the interface. Probabilities are 0 <= p <= 1, so we calculate them as a floating point number
+            # with awk. Probabilities need to be ascending with the last set to 1 since the first matched rule
+            # stops looking for matches, which means each subsequent rule is the probability that matching should
+            # stop looking any further.
+            probability=$(awk "BEGIN { print ($interface_cntr + 1) / ${#WG_INTERFACES[@]} }")
+            
+            if (( SUPPORTS_IPV4 > 0 )) && [[ -n $DEFAULT_ROUTE_IPV4 ]] ; then
+                cmd iptables -t mangle -A PREROUTING -m conntrack --ctstate NEW -m statistic --mode random --probability $probability -j MARK --set-mark $mangle_fwmark || die
+            fi
+            if (( SUPPORTS_IPV6 > 0 )) && [[ -n $DEFAULT_ROUTE_IPV6 ]] ; then
+                cmd ip6tables -t mangle -A PREROUTING -m conntrack --ctstate NEW -m statistic --mode random --probability $probability -j MARK --set-mark $mangle_fwmark || die
+            fi
+        fi
+        
+        ## Need to add a default route, but it will mostly get ignored because of the iptables rules.
+        ## Just overwrite what the prior interface(s) set for the default route
+        #if (( SUPPORTS_IPV4 > 0 )) && [[ -n $DEFAULT_ROUTE_IPV4 ]] ; then
+        #    cmd ip -4 route replace default dev $interface
+        #fi
+        #if (( SUPPORTS_IPV6 > 0 )) && [[ -n $DEFAULT_ROUTE_IPV6 ]] ; then
+        #    cmd ip -6 route replace default dev $interface
+        #fi
+    fi
+    
+    interface_cntr=$(( interface_cntr + 1 ))
 done
 
 log ""

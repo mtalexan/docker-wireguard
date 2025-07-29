@@ -24,6 +24,7 @@ Includes a Kill Switch in the container, so if WireGuard connections don't come 
 | `CHECK_IPV4` | N | (none) | An internet IPv4 address to ping to check connectivity via interfaces. Should not be in `LOCAL_SUBNETS` ranges. Ignored if the wireguard interfaces don't support IPv4. |
 | `CHECK_IPV6` | N | (none) | An internet IPv6 address to ping to check connectivity via interfaces. Should not be in `LOCAL_SUBNETS_IPV6` ranges. Ignored if the wireguard interfaces don't support IPv6. |
 | `PING_CHECKS` | N | 5 | If `CHECK_IPV4` or `CHECK_IPV6` is set, this determines how many ping packets to try. Some VPN providers can be very slow to respond on newly created wireguard connections and my require a larger number of ping attempts. Only one ping packet must succeed for it to be considered success. |
+| `IPTABLES_MANGLE_MODE` | N | `random` | One of `rr`/`round-robin`, `rand`/`random`, or an empty string. If set non-blank the multipath default route is augmented with iptable PRE/POSTROUTING rules that use the `statistic` module to assign new connections to a specific interface. `rr`/`round-robin` is self explanatory. `rand`/`random` assigns randomly with equal probability. |
 
 ### Wireguard Config Restrictions
 
