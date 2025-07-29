@@ -7,7 +7,7 @@ set -o pipefail
 readonly WG_READY_FILE="${WG_READY_FILE:-/var/run/wireguard/ready}"
 readonly LOCAL_SUBNETS="${LOCAL_SUBNETS:-}"
 readonly LOCAL_SUBNETS_IPV6="${LOCAL_SUBNETS_IPV6:-}"
-readonly PING_CHECKS=${PING_CHECKS:-5}
+readonly PING_CHECKS=${PING_CHECKS:-10}
 readonly CHECK_URL
 readonly CHECK_IPV4
 readonly CHECK_IPV6
@@ -24,12 +24,10 @@ declare -a WG_INTERFACES=()
 # If set to 0, none of the interfaces support that type of traffic going thru them.
 SUPPORTS_IPV4=0
 SUPPORTS_IPV6=0
-# List of fwmarks, indexed by interface name. Captured when interface is first brought up.
-declare -A WG_FWMARKS=()
 
 # Print arguments as the message with a fixed-format time prefix and module name
 log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') [WG-MULTIWAN]" "$@"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') " "$@"
 }
 # Print optional arguments as part of log message prefixed with 'ERROR: ', then exit with an error
 die() {
@@ -69,15 +67,43 @@ DEFAULT_ROUTE_IPV6_DEV=$(ip -6 route show default scope global | awk '{print $5}
 # Use it to pre-verify we have the necessary capability
 iptables-save >/dev/null || die "Missing --cap-add=NET_ADMIN"
     
+
+#----------------------------------------------------
+# FWMark and Routing Table detection
+#----------------------------------------------------
+
 # get all available fwmarks from the iptables
 declare -a USED_FWMARKS
-readarray -t USED_FWMARKS < <((iptables-save; ip6tables-save) | grep -iE "(mark|fwmark)" | grep -oE "(0x[0-9a-fA-F]+|[0-9]+)" | sort -nu)
+# Dump all the IPv4 and IPv6 tables and filter for any routing that specifies the mark/fwmark, and get just the fwmark value.
+readarray -t USED_FWMARKS < <((iptables-save; ip6tables-save) | grep -Eo "(mark|fwmark)\s+(0x[0-9a-fA-F]+|[0-9]+)" | awk '{print $2}' | sort -nu)
+# Print all ip rules (v4 and v6 both), locate any that use the fwmark, and get just the fwmark value.
+readarray -t USED_FWMARKS < <(ip rule list | grep -Eo "fwmark (0x[0-9a-fA-F]+|[0-9]+)" | awk '{print $2}' | sort -nu)
+
+# FWmarks don't have to match table numbers, but it's common to do so. So treat any table numbers as if they're used fwmarks also.
+
+# Print all ip rules (v4 and v6 both). The last value of each line is always the table name/number. Filter for numbers, we'll handle names later.
+readarray -O "${#USED_FWMARKS[@]}" -t USED_FWMARKS < <(ip rule list | awk '{print $NF}' | grep -E '\d+' | sort -nu)
+# Make sure we can locate the default table name file.
+[[ -f /usr/share/iproute2/rt_tables ]] || die "No default iproute tables: /usr/share/iproute2/rt_tables"
+# Get the list of built-in/named tables.  This is formatted as columns of table numbers then names, with a lot of commented lines.
+# Filter for only lines that start with a number (uncommented), and take only the first column.
+readarray -O "${#USED_FWMARKS[@]}" -t USED_FWMARKS < <(grep -E '^\d+' /usr/share/iproute2/rt_tables | awk '{print $1}' | sort -nu)
+# Get the list of manually added table names if they exist.
+if [[ -e /etc/iproute2/rt_tables ]]; then    
+    readarray -O "${#USED_FWMARKS[@]}" -t USED_FWMARKS < <(grep -E '^\d+' /etc/iproute2/rt_tables | awk '{print $1}' | sort -nu)
+fi
+
 # normalize all marks to decimal 
 for i in "${!USED_FWMARKS[@]}"; do
     # if the value was 0x..., this converts it to decimal.  If the value was already decimal, this will do nothing.
     USED_FWMARKS[$i]=$(( ${USED_FWMARKS[$i]}))
 done
+
+# Reduce the list to only unique values.
+readarray -t USED_FWMARKS < <(printf '%s\n' "${USED_FWMARKS[@]}" | sort -un)
+
 export USED_FWMARKS
+
 
 # Determines whether an fwmark is already in use or not by searching the USED_FWMARKS array.
 # Args:
@@ -103,8 +129,9 @@ is_fwmark_free() {
     fi
 }
 
-# Start at 51820, which is the wg-quick convention as well
-NEXT_FWMARK=51820
+# Start at 300. Most built-in tables are in the 0-300 range, and we consider an fwmark "used" if
+# there's a reference to an fwmark, or a routing table that uses the number.
+NEXT_FWMARK=300
 
 # Searches the available list of fwmarks between the passed value and the upper limit of 65535
 # for an unused fwmark. When located, it's printed with no newline and added to the USED_FWMARKS list.
@@ -130,6 +157,33 @@ get_next_free_fwmark_from() {
     # if we got here without returning it's because we reached the end of the possible fwmarks
     die "Searched all possible fwmarks (51280-65535), none are available."
 }
+
+#----------------------------------------------------
+# Copy default routing into a table
+#----------------------------------------------------
+
+# We assume a used fwmark or table number makes both unavailable since it's common to match them.
+# We need a table number.
+DEFAULT_TABLE=$(get_next_free_fwmark_from $NEXT_FWMARK)
+[[ -n $DEFAULT_TABLE ]] || die "No free fwmark to assign"
+# Set the one we got as now unavailable, and set subsequent searches to start with the next value.
+USED_FWMARKS+=("$DEFAULT_TABLE")
+NEXT_FWMARK=$(( DEFAULT_TABLE + 1 ))
+
+# jump to 51820, the wireguard default for fwmarks/tables, as the start point for searching
+if (( NEXT_FWMARK < 51820 )); then
+    NEXT_FWMARK=51820
+fi
+
+log "Writing all routes into a table: $DEFAULT_TABLE"
+
+# read all the routing rules into an array, one per line
+DEFAULT_ROUTES=()
+readarray -t DEFAULT_ROUTES < <(ip route show)
+for line in "${DEFAULT_ROUTES[@]}"; do
+    #shellcheck disable=SC2086 #intentionally allow word splitting on $line
+    cmd ip route add $line table $DEFAULT_TABLE || die
+done
 
 #----------------------------------------------------
 # Setup kill switch and manually configured exceptions
@@ -162,14 +216,11 @@ cmd ip6tables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT || die "M
 #          switch, and the LOCAL_SUBNETS and LOCAL_SUBNETS_IPV6 environment variables
 #          can already be used to configure this.
 
-# delete our default routes so there is no default route anymore.
-if [[ -n $DEFAULT_ROUTE_IPV4 ]]; then
-    cmd ip -4 route del default || die "Deleting default IPv4 route"
-fi
-if [[ -n $DEFAULT_ROUTE_IPV6 ]]; then
-    cmd ip -6 route del default || die "Deleting default IPv6 route"
-fi
-
+# Delete all our routes so only the ones we configure work
+for line in "${DEFAULT_ROUTES[@]}"; do
+    #shellcheck disable=SC2086 #intentionally allow word splitting of $line
+    cmd ip route del $line || die
+done
 
 if [[ -z $DEFAULT_ROUTE_IPV4_DEV ]]; then
     [[ -z $LOCAL_SUBNETS ]] || log "WARN: No IPv4 route for LOCAL_SUBNETS to use"
@@ -177,8 +228,9 @@ else
     # Allow traffic to specified local IPv4 subnets
     for local_subnet in ${LOCAL_SUBNETS//,/$IFS}; do
     	log "Allowing traffic to local subnet ${local_subnet}"
-    	cmd ip -4 route add $local_subnet via ${DEFAULT_ROUTE_IPV4} dev $DEFAULT_ROUTE_IPV4_DEV
-    	cmd iptables -I OUTPUT -d $local_subnet -j ACCEPT
+        cmd ip -4 rule add from $local_subnet table $DEFAULT_TABLE || die
+    	#cmd ip -4 route add $local_subnet via ${DEFAULT_ROUTE_IPV4} dev $DEFAULT_ROUTE_IPV4_DEV || die
+    	cmd iptables -I OUTPUT -d $local_subnet -j ACCEPT || die
     done
 fi
 
@@ -188,15 +240,16 @@ else
     # Allow traffic to specified local IPv6 subnets
     for local_subnet in ${LOCAL_SUBNETS_IPV6//,/$IFS}; do
     	log "Allowing traffic to local subnet ${local_subnet}"
-    	cmd ip -6 route add $local_subnet via ${DEFAULT_ROUTE_IPV6} dev $DEFAULT_ROUTE_IPV6_DEV
-    	cmd ip6tables -I OUTPUT -d $local_subnet -j ACCEPT
+        cmd ip -6 rule add from $local_subnet table $DEFAULT_TABLE || die
+    	#cmd ip -6 route add $local_subnet via ${DEFAULT_ROUTE_IPV6} dev $DEFAULT_ROUTE_IPV6_DEV || die
+    	cmd ip6tables -I OUTPUT -d $local_subnet -j ACCEPT || die
     done
 fi
 
 if [[ -v CHECK_IPV4 ]] && [[ -n $DEFAULT_ROUTE_IPV4_DEV ]]; then
     log "Verifying former IPv4 default network route is inaccessible"
     # this should fail immediately with a "no path to destination" error. But if not, there's a default 10 sec per packet limit
-    if cmd ping -4 -c 2 -I $DEFAULT_ROUTE_IPV4_DEV "$CHECK_IPV4"; then
+    if cmd ping -4 -c 10 -I $DEFAULT_ROUTE_IPV4_DEV "$CHECK_IPV4"; then
         die "Route thru $DEFAULT_ROUTE_IPV4_DEV isn't blocked by kill switch"
     else
         log "Killswitch verified to successfully block connections via $DEFAULT_ROUTE_IPV4_DEV"
@@ -206,7 +259,7 @@ fi
 if [[ -v CHECK_IPV6 ]] && [[ -n $DEFAULT_ROUTE_IPV6_DEV ]]; then
     log "Verifying former IPv6 default network route is inaccessible"
     # this should fail immediately with a "no path to destination" error. But if not, there's a default 10 sec per packet limit
-    if cmd ping -6 -c 2 -I $DEFAULT_ROUTE_IPV6_DEV "$CHECK_IPV6"; then
+    if cmd ping -6 -c 10 -I $DEFAULT_ROUTE_IPV6_DEV "$CHECK_IPV6"; then
         die "Route thru $DEFAULT_ROUTE_IPV6_DEV isn't blocked by kill switch"
     else
         log "Killswitch verified to successfully block connections via $DEFAULT_ROUTE_IPV6_DEV"
@@ -349,20 +402,13 @@ for interface in "${WG_INTERFACES[@]}"; do
     # ones from /etc/wireguard instead.
     # 
     # WARNING: We enforce above that the config file has Table=off so this won't create any rules or a table automatically.
-    #          It auto-assigns a fwmark for the interface traffic only if Fwmark= is set in the file, otherwise we have 
-    #          We enforce that the AllowedIPs is only CIDRs with /0, which means they're 
+    #          wg-quick assigns a fwmark for the interface traffic only if Fwmark= is set in the file, otherwise we have to assign one.
+    #          We enforce that the AllowedIPs is only CIDRs with /0, which means they're for all traffic. 
     cmd wg-quick up "${WG_CONF_OUT}/${interface}.conf" || die "Failed to start interface $interface"
-    
-    # Add exceptions to our kill switch iptables to allow traffic to the interface, and the fwmarked encrypted
-    # traffic out normally.
-    # For interfaces that didn't set Fwmark= explciitly, we have to find an available fwmark and set it.
-    # Since no routes were auto-created by wg-quick, we also need to add the default route for fwmarked traffic out thru the
-    # original default device.
 
-    # Since Table=off, the only way this gets set is if Fwmark= is set explicitly.  If not set it will report 'off'.
-    # We need to find what fwmark isn't yet used so we can assign it.
+    # If Fwmark= was in the config file, it will already be set here. Otherwise we need to find an available one and assign it.
     fwmark=$(wg show "$interface" fwmark 2>/dev/null)
-    if [[ -n "$fwmark" && "$fwmark" == "off" ]]; then
+    if [[ -z "$fwmark" || "$fwmark" == "off" ]]; then
         fwmark="$(get_next_free_fwmark_from $NEXT_FWMARK)"
         [[ -n $fwmark ]] || die "Getting next available fwmark"
         
@@ -388,7 +434,7 @@ for interface in "${WG_INTERFACES[@]}"; do
             || die "Adding iptables exception for traffic to $interface"
     fi
     
-    log "$interface: Adding firewall rule for fwmark $fwmark on $interface"
+    log "$interface: Adding firewall rule for allowing fwmark $fwmark traffic (encrypted traffic)"
     # Allow the fwmark traffic out normally. This is the wireguard interface encrypted traffic.
     # Add these exceptions if we had an initial default route that supports the type. It won't
     # get used if no Endpoint was specified for the IP addr type, but we don't want to parse that
@@ -405,24 +451,16 @@ for interface in "${WG_INTERFACES[@]}"; do
     # We do NOT need rules to allow traffic to the endpoints, traffic going there is
     # fwmarked so it's already allowed.
     
-    log "$interface: Adding routes/rules to allow fwmarked encrypted interface packets out"
-    # Add a default routing rule to a table that will route traffic sent to the table thru the default route.
-    # The table number uses the decimal fwmark number (standard convention).
-    # Then add a rule that fwmarked packets should go to that table.
-    # Add these default routes if we had an initial default route that supports the type. It won't get
-    # used if no Endpoint was specified for the IP addr type, but we don't want to have to parse
-    # that field to find out.
+    log "$interface: Adding rule to direct fwmarked (encrypted traffic) to the table all default routing rules were moved to: $DEFAULT_TABLE"
+    # All the routing rules when we first started were copied into a new table. The killswitch then deleted all routes.
+    # We direct the encrypted packets from the interface to the table with our normal routing rules in it. 
     if [[ -n $DEFAULT_ROUTE_IPV4_DEV ]]; then
-        cmd ip -4 route add default via $DEFAULT_ROUTE_IPV4 dev $DEFAULT_ROUTE_IPV4_DEV table $fwmark \
-            || die "$interface: Adding to table $fwmark default IPv4 route via $DEFAULT_ROUTE_IPV4 ($DEFAULT_ROUTE_IPV4_DEV)"
-        cmd ip -4 rule add fwmark "$(printf '0x%x' "$fwmark")" table $fwmark \
-            || die "$interface: Adding rule for fwmark $fwmark to route to table $fwmark"
+        cmd ip -4 rule add fwmark "$(printf '0x%x' "$fwmark")" table $DEFAULT_TABLE \
+            || die "$interface: Adding rule for fwmark $fwmark to route to table $DEFAULT_TABLE which contains former default routes"
     fi
     if [[ -n $DEFAULT_ROUTE_IPV6_DEV ]]; then
-        cmd ip -6 route add default via $DEFAULT_ROUTE_IPV6 dev $DEFAULT_ROUTE_IPV6_DEV table $fwmark \
-            || die "$interface: Adding to table $fwmark default IPv6 route via $DEFAULT_ROUTE_IPV6 ($DEFAULT_ROUTE_IPV6_DEV)"
-        cmd ip -6 rule add fwmark "$(printf '0x%x' "$fwmark")" table $fwmark \
-            || die "$interface: Adding rule for fwmark $fwmark to route to table $fwmark"
+        cmd ip -6 rule add fwmark "$(printf '0x%x' "$fwmark")" table $DEFAULT_TABLE \
+            || die "$interface: Adding rule for fwmark $fwmark to route to table $DEFAULT_TABLE which contains former default routes"
     fi
     
     # WARNING: Pinging IP addresses or trying to curl connect to a URL will not work until the multipath is setup (for some reason),
@@ -433,16 +471,18 @@ for interface in "${WG_INTERFACES[@]}"; do
     # and we have no way to determine the gateway used by the other side of the wireguard connection.
     ipv4_nexthops+=("nexthop" "dev" "$interface" "weight" "1")
         
-    # Despite having no way to get the gateway, with IPv6 multipath is *required* to include a gateway address.
-    # We effectively just guess that the link-local IPv6 address of the gateway is fe80::1, because there's no way
-    # to know what it actually is since that's now how wireguard works.
+    # Despite having no way to get the gateway, IPv6 multipath is *required* to include a gateway address.
+    # We effectively guess that the link-local IPv6 address of the gateway is fe80::1, because there's no way
+    # to know what it actually is (that's now how wireguard works) and it's highly likely to be a correct guess.
     ipv6_nexthops+=("nexthop" "via" "fe80::1" "dev" "$interface" "weight" "1")
 done
 
 log ""
 log "All WireGuard interfaces started successfully"
 
-# Setup the multipath nexthop default routes. We can only set the multipath route if the container supports the IP address type as well.
+# Setup the multipath nexthop default routes.
+# The wireguard interfaces need to support the IP-type, but also we need the container to support networking
+# with that IP-type.
 if (( SUPPORTS_IPV4 > 0 )) && [[ -n $DEFAULT_ROUTE_IPV4 ]] ; then
     log "Creating multipath default IPv4 route"
     cmd ip -4 route add default scope global "${ipv4_nexthops[@]}" \
@@ -453,6 +493,9 @@ if (( SUPPORTS_IPV6 > 0 )) && [[ -n $DEFAULT_ROUTE_IPV6 ]] ; then
     cmd ip -6 route add default scope global "${ipv4_nexthops[@]}" \
         || die "Creating default IPv6 route for multipath"
 fi
+
+# WARNING: These checks will sometimes fail. Some VPN providers are incredibly slow to function when
+#          the interface first comes up, and can take minutes before they actually start working properly.
 
 if [[ -v CHECK_IPV4 ]] && (( SUPPORTS_IPV4 > 0 )); then
     for interface in "${WG_INTERFACES[@]}"; do
@@ -471,6 +514,11 @@ if [[ -v CHECK_IPV6 ]] && (( SUPPORTS_IPV6 > 0 )); then
     log "Verifying IPv6 connectivity of default multipath"
     cmd ping -6 -c $PING_CHECKS "$CHECK_IPV6" || die "Can't connect via multipath route"
 fi
+
+log "Force-initializing DNS by querying for canhazip.com"
+# This will fail the first time with some VPN providers, so do it once and ignore it.
+#  
+nslookup canhazip.com &>/dev/null || :
 
 #if there was a CHECK_URL set, we should be able to check it now that we can resolve DNS
 if [[ -v CHECK_URL ]]; then
