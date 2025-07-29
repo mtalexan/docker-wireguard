@@ -527,8 +527,15 @@ if [[ -v CHECK_URL ]]; then
         cmd timeout 120 curl -sSL --interface $interface "${CHECK_URL}" || die "Can't connect via $interface"
     done
     log "Checking IP of default route:"
-    # run this with a timeout so it will self-terminate in 120s if it can't make a connection.
-    cmd timeout 120 curl -sSL "${CHECK_URL}" || die "Can't connect via default interface multi-path route"
+    # retry up to 5 times.
+    success=
+    for i in $(seq 1 5); do 
+        # run this with a timeout so it will self-terminate in 120s if it can't make a connection.
+        cmd timeout 120 curl -sSL "${CHECK_URL}" || continue
+        success=1
+        break
+    done
+    [[ -n $success ]] || die "Can't connect via default interface multi-path route"
 fi
 
 mkdir -p "$(dirname "${WG_READY_FILE}")" || die "Creating Ready flag file directory: $(dirname "${WG_READY_FILE}")"
