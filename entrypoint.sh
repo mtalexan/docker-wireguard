@@ -527,9 +527,11 @@ if [[ -v CHECK_URL ]]; then
         cmd timeout 120 curl -sSL --interface $interface "${CHECK_URL}" || die "Can't connect via $interface"
     done
     log "Checking IP of default route:"
-    # retry up to 5 times.
+    # For some reason the multipath will often fail to resolve the hostname, even though it was just
+    # resolved fine via each individual interface in the multipath.
+    # retry up to 10 times. 
     success=
-    for i in $(seq 1 5); do 
+    for i in $(seq 1 10); do 
         # run this with a timeout so it will self-terminate in 120s if it can't make a connection.
         cmd timeout 120 curl -sSL "${CHECK_URL}" || continue
         success=1
